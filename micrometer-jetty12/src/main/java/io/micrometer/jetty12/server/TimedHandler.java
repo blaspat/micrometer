@@ -21,7 +21,6 @@ import io.micrometer.core.instrument.Tag;
 import io.micrometer.core.instrument.Timer;
 import org.eclipse.jetty.http.HttpFields;
 import org.eclipse.jetty.server.Request;
-import org.eclipse.jetty.server.Response;
 import org.eclipse.jetty.server.handler.EventsHandler;
 import org.eclipse.jetty.util.Callback;
 import org.eclipse.jetty.util.component.Graceful;
@@ -44,8 +43,6 @@ public class TimedHandler extends EventsHandler implements Graceful {
     private static final String SAMPLE_HANDLER_LONG_TASK_TIMER_ATTRIBUTE = "__micrometer_handler_ltt_sample";
 
     protected static final String RESPONSE_STATUS_ATTRIBUTE = "__micrometer_jetty_core_response_status";
-
-    private static final String RESPONSE_ATTRIBUTE = "__micrometer_jetty_core_response";
 
     private final MeterRegistry registry;
 
@@ -78,7 +75,6 @@ public class TimedHandler extends EventsHandler implements Graceful {
         this.registry = registry;
         this.tags = tags;
         this.tagsProvider = tagsProvider;
-
         this.timerRequest = LongTaskTimer.builder("jetty.server.requests.open")
             .description("Jetty requests that are currently in progress")
             .tags(tags)
@@ -99,40 +95,32 @@ public class TimedHandler extends EventsHandler implements Graceful {
 
     @Override
     protected void onAfterHandling(Request request, boolean handled, Throwable failure) {
-        // Same issue as onComplete: onResponseBegin fires before the handler sets
-        // the status, so the attribute may still be 0. Update it here too so
-        // stopHandlerTiming sees the correct status for the handler timer.
-        Response response = (Response) request.getAttribute(RESPONSE_ATTRIBUTE);
-        setAttributeToRequest(response, request);
         stopHandlerTiming(request);
         super.onAfterHandling(request, handled, failure);
     }
 
     @Override
     protected void onResponseBegin(Request request, int status, HttpFields headers) {
-        // If we see a status of 0 here, that mean the Handler hasn't set a status code.
+        // onResponseBegin may fire before the handler sets the status code,
+        // so the status here might be 0 (unset). Capture it as a fallback;
+        // onComplete will override this with the actual status if needed.
         request.setAttribute(RESPONSE_STATUS_ATTRIBUTE, status);
         super.onResponseBegin(request, status, headers);
     }
 
     @Override
-    protected void onComplete(Request request, Throwable failure) {
-        // Jetty 12 fires onResponseBegin before the handler sets a response status,
-        // so the status captured in onResponseBegin is 0 (unset). We need to capture
-        // the actual status here in onComplete so that tags reflect the real status.
-        Response response = (Response) request.getAttribute(RESPONSE_ATTRIBUTE);
-        setAttributeToRequest(response, request);
-        stopRequestTiming(request);
-        super.onComplete(request, failure);
-    }
-
-    private void setAttributeToRequest(Response response, Request request) {
-        if (response != null) {
-            int status = response.getStatus();
-            if (status > 0) {
-                request.setAttribute(RESPONSE_STATUS_ATTRIBUTE, status);
-            }
+    protected void onComplete(Request request, int status, HttpFields headers, Throwable failure) {
+        // The 4-param onComplete receives the final HTTP status directly from Jetty,
+        // after the handler has set it. This is the clean way to get the real status
+        // without the attribute-juggling dance that was needed with onResponseBegin.
+        //
+        // Use the status from this event if it's valid (> 0), otherwise fall back to
+        // whatever was recorded in onResponseBegin (might be 0 if status was never set).
+        if (status > 0) {
+            request.setAttribute(RESPONSE_STATUS_ATTRIBUTE, status);
         }
+        stopRequestTiming(request);
+        super.onComplete(request, status, headers, failure);
     }
 
     private void beginRequestTiming(Request request) {
@@ -191,7 +179,6 @@ public class TimedHandler extends EventsHandler implements Graceful {
     public boolean handle(Request request, Response response, Callback callback) throws Exception {
         Timer.Sample sample = Timer.start(registry);
         request.setAttribute(SAMPLE_TIMER_ATTRIBUTE, sample);
-        request.setAttribute(RESPONSE_ATTRIBUTE, response);
         return super.handle(request, response, callback);
     }
 
